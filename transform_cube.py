@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import sys, os
 import pandas as pd
+from pathlib import Path
 
 def load_point_cloud(points3D_df):
 
@@ -94,8 +95,10 @@ def update_scale(vis):
 vis = o3d.visualization.VisualizerWithKeyCallback()
 vis.create_window()
 
-# load point cloud
-points3D_df = pd.read_pickle("data/points3D.pkl")
+# load point cloud (robust path relative to this file)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+points3D_df = pd.read_pickle(DATA_DIR / "points3D.pkl")
 pcd = load_point_cloud(points3D_df)
 vis.add_geometry(pcd)
 
@@ -152,5 +155,5 @@ print('Translation vector:\n{}'.format(t))
 print('Scale factor: {}'.format(scale))
 '''
 
-np.save('cube_transform_mat.npy', get_transform_mat(R_euler, t, scale))
-np.save('cube_vertices.npy', np.asarray(cube.vertices))
+np.save(str(BASE_DIR / 'cube_transform_mat.npy'), get_transform_mat(R_euler, t, scale))
+np.save(str(BASE_DIR / 'cube_vertices.npy'), np.asarray(cube.vertices))

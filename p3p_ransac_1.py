@@ -1,4 +1,5 @@
 from scipy.spatial.transform import Rotation as R
+from scipy.optimize import least_squares
 import pandas as pd
 import numpy as np
 import random
@@ -23,86 +24,247 @@ def average_desc(train_df, points3D_df):
     desc = desc.join(points3D_df.set_index("POINT_ID"), on="POINT_ID")
     return desc
 
-def pnpsolver(query,model,cameraMatrix=0,distortion=0):
-    kp_query, desc_query = query
-    kp_model, desc_model = model
-    cameraMatrix = np.array([[1868.27, 0, 540],
-                             [0, 1869.18, 960],
-                             [0, 0, 1]], dtype=np.float64)
-    distCoeffs = np.array([0.0847023, -0.192929, -0.000201144, -0.000725352], dtype=np.float64)
-    # Descriptor matching with FLANN (KD-Tree) and ratio test
-    if desc_query is None or len(desc_query) == 0 or desc_model is None or len(desc_model) == 0:
-        return False, None, None, None
-    
-    # L2 normalize descriptors (helps after averaging and for robust matching)
-    desc_query = np.asarray(desc_query, dtype=np.float32)
-    n = np.linalg.norm(desc_query, axis=1, keepdims=True) + 1e-8
-    desc_query = desc_query / n
-    desc_model = np.asarray(desc_model, dtype=np.float32)
-    # FLANN match + ratio test (fewer checks for speed)
-    # KDTree for float descriptors: algorithm=1
-    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=16))
+def p3p(p_w, p_i, K):
+    """
+    Solves the P3P problem.
+    Args:
+        p_w: 3x3 numpy array of 3D points in world coordinates.
+        p_i: 2x3 numpy array of 2D projections in image coordinates.
+        K: 3x3 camera intrinsic matrix.
+    Returns:
+        A list of possible (R, t) tuples.
+    """
+    eps = 1e-9
+    # Convert image points to normalized camera coordinates
+    Kinv = np.linalg.inv(K)
+    p_c = Kinv @ np.vstack((p_i, np.ones(3)))
+    # Normalize rays (guard divide-by-zero)
+    norms = np.linalg.norm(p_c, axis=0)
+    if np.any(norms < eps) or not np.all(np.isfinite(norms)):
+        return []
+    v = p_c / norms
+
+    # Distances between 3D points (guard degeneracy)
+    d_12_sq = float(np.sum((p_w[:, 0] - p_w[:, 1])**2))
+    d_23_sq = float(np.sum((p_w[:, 1] - p_w[:, 2])**2))
+    d_31_sq = float(np.sum((p_w[:, 2] - p_w[:, 0])**2))
+    # Triangle area check
+    area2 = np.linalg.norm(np.cross(p_w[:, 1] - p_w[:, 0], p_w[:, 2] - p_w[:, 0]))**2
+    if d_12_sq < 1e-8 or d_23_sq < 1e-8 or d_31_sq < 1e-8 or area2 < 1e-12:
+        return []
+
+    # Cosines of angles between rays
+    cos_alpha = float(np.clip(v[:, 1].T @ v[:, 2], -1.0, 1.0))
+    cos_beta  = float(np.clip(v[:, 0].T @ v[:, 2], -1.0, 1.0))
+    cos_gamma = float(np.clip(v[:, 0].T @ v[:, 1], -1.0, 1.0))
+
+    # Coefficients of the quartic equation
+    A4 = ((d_12_sq - d_31_sq) / d_23_sq - 1)**2 - 4 * d_31_sq / d_23_sq * cos_gamma**2
+    A3 = 4 * (((d_12_sq - d_31_sq) / d_23_sq) * (1 - (d_12_sq - d_31_sq) / d_23_sq) * cos_beta - (1 - (d_12_sq + d_31_sq) / d_23_sq) * cos_alpha * cos_gamma + 2 * d_31_sq / d_23_sq * cos_gamma**2 * cos_beta)
+    A2 = 2 * (((d_12_sq - d_31_sq) / d_23_sq)**2 - 1 + 2 * ((d_12_sq - d_31_sq) / d_23_sq)**2 * cos_beta**2 + 2 * ((d_23_sq - d_31_sq) / d_23_sq) * cos_alpha**2 - 4 * ((d_12_sq + d_31_sq) / d_23_sq) * cos_alpha * cos_beta * cos_gamma + 2 * ((d_23_sq - d_12_sq) / d_23_sq) * cos_gamma**2)
+    A1 = 4 * (-(d_12_sq - d_31_sq) / d_23_sq * (1 + (d_12_sq - d_31_sq) / d_23_sq) * cos_beta + 2 * d_12_sq / d_23_sq * cos_alpha**2 * cos_beta - (1 - (d_12_sq + d_31_sq) / d_23_sq) * cos_alpha * cos_gamma)
+    A0 = (1 + (d_12_sq - d_31_sq) / d_23_sq)**2 - 4 * d_12_sq / d_23_sq * cos_alpha**2
+
+    coeffs = np.array([A4, A3, A2, A1, A0], dtype=float)
+    # Guard invalid/inf coefficients (degenerate sample)
+    if not np.all(np.isfinite(coeffs)):
+        return []
+    # If leading term ~0, fall back to lower degree
+    if abs(coeffs[0]) < 1e-12:
+        coeffs = coeffs[1:]
+        if coeffs.size < 2 or not np.any(np.abs(coeffs) > 0):
+            return []
+    # Solve for x = d1/d2 (catch numeric failures)
     try:
-        matches = flann.knnMatch(desc_query, desc_model, k=2)
-    except cv2.error:
-        return False, None, None, None
-    
-    good = []
-    for m_n in matches:
-        if len(m_n) < 2:
+        x_roots = np.roots(coeffs)
+    except Exception:
+        return []
+    x_reals = x_roots[np.isreal(x_roots)].real
+
+    solutions = []
+    for x in x_reals:
+        # Solve for y = d3/d2
+        y = ((d_12_sq - d_31_sq) / d_23_sq - 1) * x**2 - 2 * ((d_12_sq - d_31_sq) / d_23_sq) * cos_beta * x + 1 + (d_12_sq - d_31_sq) / d_23_sq
+        
+        if y <= 0:
             continue
-        m, n = m_n
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
-    # Keep only top-N matches to limit RANSAC per-iteration cost
-    if good:
-        good.sort(key=lambda m: m.distance)
-        good = good[:800]
-    if len(good) < 4:
-        return False, None, None, None
-    # Use float32 to reduce memory and improve speed
-    img_pts = np.array([kp_query[m.queryIdx] for m in good], dtype=np.float32).reshape(-1,1,2)
-    obj_pts = np.array([kp_model[m.trainIdx] for m in good], dtype=np.float32).reshape(-1,1,3)
-    # RANSAC PnP
-    # Prefer AP3P (fast minimal solver) if available; fallback to EPNP
-    pnp_flag = getattr(cv2, "SOLVEPNP_AP3P", cv2.SOLVEPNP_EPNP)
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        objectPoints=obj_pts,
-        imagePoints=img_pts,
-        cameraMatrix=cameraMatrix,
-        distCoeffs=distCoeffs,
-        iterationsCount=1000,
-        reprojectionError=4.0,
-        confidence=0.995,
-        flags=pnp_flag
-    )
-    if not success or inliers is None or len(inliers) < 4:
-        return False, None, None, None
-    # Flatten inliers and refine
-    inliers = inliers.ravel()
-    obj_in = obj_pts[inliers].reshape(-1,1,3)
-    img_in = img_pts[inliers].reshape(-1,1,2)
-    success2, rvec2, tvec2 = cv2.solvePnP(
-        objectPoints=obj_in,
-        imagePoints=img_in,
-        cameraMatrix=cameraMatrix,
-        distCoeffs=distCoeffs,
-        rvec=rvec, tvec=tvec,
-        useExtrinsicGuess=True,
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
-    if not success2:
-        return False, None, None, None
-    # Optional Levenberg-Marquardt refine if available (OpenCV >= 4.1)
-    refine_fn = getattr(cv2, "solvePnPRefineLM", None)
-    if refine_fn is not None:
-        rvec2, tvec2 = refine_fn(objectPoints=obj_in,
-                                 imagePoints=img_in,
-                                 cameraMatrix=cameraMatrix,
-                                 distCoeffs=distCoeffs,
-                                 rvec=rvec2,
-                                 tvec=tvec2)
-    return True, rvec2, tvec2, inliers
+        y = np.sqrt(y)
+
+        # Solve for d2
+        d2_sq_num = d_12_sq
+        d2_sq_den = x**2 - 2 * x * cos_gamma + 1
+        if d2_sq_den <= 1e-8:
+            continue
+        d2 = np.sqrt(d2_sq_num / d2_sq_den)
+
+        # Get d1, d3
+        d1 = x * d2
+        d3 = y * d2
+
+        # Two possible solutions for y (sqrt)
+        for sign in [1, -1]:
+            d3_sol = sign * d3
+            
+            # Check if distances are positive
+            if d1 > 0 and d2 > 0 and d3_sol > 0:
+                # 3D points in camera coordinates
+                p_c_calc = np.zeros((3, 3))
+                p_c_calc[:, 0] = d1 * v[:, 0]
+                p_c_calc[:, 1] = d2 * v[:, 1]
+                p_c_calc[:, 2] = d3_sol * v[:, 2]
+
+                # Check distances
+                if not np.allclose(np.sum((p_c_calc[:, 1] - p_c_calc[:, 2])**2), d_23_sq, atol=1e-3):
+                    continue
+                if not np.allclose(np.sum((p_c_calc[:, 0] - p_c_calc[:, 2])**2), d_31_sq, atol=1e-3):
+                    continue
+
+                # Find R, t using Horn's method (absolute orientation)
+                p_w_centroid = np.mean(p_w, axis=1, keepdims=True)
+                p_c_centroid = np.mean(p_c_calc, axis=1, keepdims=True)
+                
+                H = (p_w - p_w_centroid) @ (p_c_calc - p_c_centroid).T
+                
+                U, S, Vt = np.linalg.svd(H)
+                
+                R = Vt.T @ U.T
+                
+                if np.linalg.det(R) < 0:
+                    Vt[2, :] *= -1
+                    R = Vt.T @ U.T
+                
+                t = p_c_centroid - R @ p_w_centroid
+                solutions.append((R, t))
+
+    # If quartic produced valid solutions, return them
+    if len(solutions) > 0:
+        return solutions
+
+    # Fallback: numeric P3P via three scale variables on unit rays + Kabsch
+    f = v  # 3x3 unit rays corresponding to p_i columns
+    d12 = np.sqrt(d_12_sq); d23 = np.sqrt(d_23_sq); d13 = np.sqrt(d_31_sq)
+    c12 = float(np.dot(f[:,0], f[:,1]))
+    c23 = float(np.dot(f[:,1], f[:,2]))
+    c13 = float(np.dot(f[:,0], f[:,2]))
+
+    def residuals(s):
+        s1, s2, s3 = s
+        r1 = (s1*s1 + s2*s2 - 2*s1*s2*c12) - d12*d12
+        r2 = (s2*s2 + s3*s3 - 2*s2*s3*c23) - d23*d23
+        r3 = (s1*s1 + s3*s3 - 2*s1*s3*c13) - d13*d13
+        return np.array([r1, r2, r3], dtype=float)
+
+    def jac(s):
+        s1, s2, s3 = s
+        return np.array([
+            [2*(s1 - s2*c12), 2*(s2 - s1*c12), 0.0],
+            [0.0, 2*(s2 - s3*c23), 2*(s3 - s2*c23)],
+            [2*(s1 - s3*c13), 0.0, 2*(s3 - s1*c13)],
+        ], dtype=float)
+
+    d_mean = max(1e-3, (d12 + d23 + d13)/3.0)
+    s0 = np.array([d_mean, d_mean, d_mean], dtype=float)
+    try:
+        res = least_squares(residuals, s0, jac=jac, method='lm', max_nfev=40)
+    except Exception:
+        res = least_squares(residuals, s0, method='trf', loss='soft_l1', f_scale=1.0, max_nfev=60)
+    if not res.success:
+        return []
+    s = res.x
+    if np.any(~np.isfinite(s)) or np.any(s <= 0):
+        return []
+    X_cam = (f * s.reshape(3,1))  # 3x3
+    # Kabsch to align world->camera: minimize ||X_cam - R*p_w - t||
+    Pw = p_w
+    Pw_c = Pw - Pw.mean(axis=1, keepdims=True)
+    Xc_c = X_cam - X_cam.mean(axis=1, keepdims=True)
+    H = Pw_c @ Xc_c.T
+    U, Sg, Vt = np.linalg.svd(H)
+    Rm = Vt.T @ U.T
+    if np.linalg.det(Rm) < 0:
+        Vt[2,:] *= -1
+        Rm = Vt.T @ U.T
+    t = X_cam.mean(axis=1, keepdims=True) - Rm @ Pw.mean(axis=1, keepdims=True)
+    return [(Rm, t)]
+
+def ransac_p3p(p_w, p_i, K, threshold, iterations):
+    """
+    P3P with RANSAC.
+    Args:
+        p_w: 3xN numpy array of 3D points in world coordinates.
+        p_i: 2xN numpy array of 2D projections in image coordinates.
+        K: 3x3 camera intrinsic matrix.
+        threshold: Inlier threshold for reprojection error.
+        iterations: Number of RANSAC iterations.
+    Returns:
+        Best (R, t) tuple and inlier indices.
+    """
+    best_inliers_count = 0
+    best_R, best_t = None, None
+    best_inliers_indices = None
+    num_points = p_w.shape[1]
+
+    for i in range(iterations):
+        # Randomly sample 3 points
+        sample_indices = np.random.choice(num_points, 3, replace=False)
+        p_w_sample = p_w[:, sample_indices]
+        p_i_sample = p_i[:, sample_indices]
+
+        # Solve P3P for the sample
+        poses = p3p(p_w_sample, p_i_sample, K)
+
+        for R_est, t_est in poses:
+            # Project all points; use only points in front of camera
+            Pc = (R_est @ p_w) + t_est
+            valid = Pc[2, :] > 1e-6
+            if valid.sum() < 3:
+                continue
+            p_i_proj_h = K @ Pc[:, valid]
+            p_i_proj = p_i_proj_h[:2, :] / np.clip(p_i_proj_h[2, :], 1e-8, None)
+
+            # Calculate reprojection error only on valid
+            err = np.linalg.norm(p_i[:, valid] - p_i_proj, axis=0)
+            inliers_local = np.where(err < threshold)[0]
+            inliers_indices = np.where(valid)[0][inliers_local]
+            inliers_count = len(inliers_indices)
+
+            # Update best model if current one is better
+            if inliers_count > best_inliers_count:
+                best_inliers_count = inliers_count
+                best_R, best_t = R_est, t_est
+                best_inliers_indices = inliers_indices
+                
+                # Optional: LM refine on inliers (reprojection error)
+                if len(inliers_indices) >= 4:
+                    Pw_in = p_w[:, inliers_indices]
+                    uv_in = p_i[:, inliers_indices]
+
+                    def reproj_resid(x):
+                        rvec = x[:3]
+                        tvec = x[3:]
+                        Rm = R.from_rotvec(rvec).as_matrix()
+                        Pc2 = (Rm @ Pw_in) + tvec.reshape(3,1)
+                        z = Pc2[2, :]
+                        mask = z > 1e-6
+                        if mask.sum() == 0:
+                            return np.ones(uv_in.size) * 1e6
+                        uvp_h = K @ Pc2[:, mask]
+                        uvp = uvp_h[:2, :] / np.clip(uvp_h[2, :], 1e-8, None)
+                        r = (uvp - uv_in[:, mask]).reshape(-1)
+                        return r
+
+                    x0 = np.zeros(6, dtype=float)
+                    x0[:3] = R.from_matrix(best_R).as_rotvec()
+                    x0[3:] = best_t.reshape(3)
+                    try:
+                        opt = least_squares(reproj_resid, x0, method='trf', loss='huber', f_scale=4.0, max_nfev=50)
+                        best_R = R.from_rotvec(opt.x[:3]).as_matrix()
+                        best_t = opt.x[3:].reshape(3,1)
+                    except Exception:
+                        pass
+
+
+    return best_R, best_t, best_inliers_indices
 
 def rotation_error(R1, R2):
     R1 = np.asarray(R1)
@@ -426,6 +588,7 @@ def visualization(
         except Exception:
             pass
     o3d.visualization.draw_geometries(geoms)
+
 if __name__ == "__main__":
     # Load data
     BASE_DIR = Path(__file__).resolve().parent
@@ -444,8 +607,6 @@ if __name__ == "__main__":
     desc_model = desc_model / norms
 
 
-    # Use all available query/validation images from point_desc_df
-    # IMAGE_ID_LIST = sorted(point_desc_df["IMAGE_ID"].unique().tolist())
     # Only use validation images (filename contains 'valid') and ensure descriptors exist
     valid_mask = images_df["NAME"].astype(str).str.contains("valid", case=False, regex=False)
     valid_ids = set(images_df.loc[valid_mask, "IMAGE_ID"].tolist())
@@ -456,8 +617,17 @@ if __name__ == "__main__":
     rotation_error_list = []
     translation_error_list = []
     img_wh = None
+
+    # Camera intrinsics, matching the (now removed) pnpsolver
+    cameraMatrix = np.array([[1868.27, 0, 540],
+                             [0, 1869.18, 960],
+                             [0, 0, 1]], dtype=np.float64)
+
+    # FLANN matcher for descriptor matching
+    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=16))
+
     for idx in tqdm(IMAGE_ID_LIST):
-        # Load quaery image
+        # Load query image
         fname = (images_df.loc[images_df["IMAGE_ID"] == idx])["NAME"].values[0]
         rimg = cv2.imread(str(DATA_DIR / "frames" / fname), cv2.IMREAD_GRAYSCALE)
         if rimg is not None and img_wh is None:
@@ -468,13 +638,48 @@ if __name__ == "__main__":
         points = point_desc_df.loc[point_desc_df["IMAGE_ID"] == idx]
         kp_query = np.array(points["XY"].to_list())
         desc_query = np.array(points["DESCRIPTORS"].to_list()).astype(np.float32)
+        
+        # Normalize query descriptors
+        desc_query_norm = np.linalg.norm(desc_query, axis=1, keepdims=True) + 1e-8
+        desc_query = desc_query / desc_query_norm
 
-        # Find correspondance and solve pnp
-        retval, rvec, tvec, inliers = pnpsolver((kp_query, desc_query), (kp_model, desc_model))
-        # rotq = R.from_rotvec(rvec.reshape(1,3)).as_quat() # Convert rotation vector to quaternion
-        # tvec = tvec.reshape(1,3) # Reshape translation vector
-        if not retval:
+        # Find correspondences using FLANN
+        try:
+            matches = flann.knnMatch(desc_query, desc_model, k=2)
+        except cv2.error:
             continue
+
+        good = []
+        for m_n in matches:
+            if len(m_n) < 2:
+                continue
+            m, n = m_n
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+        
+        if len(good) < 4: # Need at least 4 points for PnP, but RANSAC needs more to be robust
+            continue
+
+        # Prepare points for our custom ransac_p3p
+        # p_w: 3xN, p_i: 2xN
+        obj_pts = np.array([kp_model[m.trainIdx] for m in good], dtype=np.float64).T
+        img_pts = np.array([kp_query[m.queryIdx] for m in good], dtype=np.float64).T
+
+        # Call our own RANSAC P3P implementation
+        R_est, t_est, inliers = ransac_p3p(
+            p_w=obj_pts,
+            p_i=img_pts,
+            K=cameraMatrix,
+            threshold=4.0,  # Reprojection error threshold in pixels
+            iterations=1000
+        )
+
+        if R_est is None or t_est is None:
+            continue
+
+        # Convert rotation matrix to rotation vector for error calculation
+        rvec = R.from_matrix(R_est).as_rotvec()
+        tvec = t_est
 
         r_list.append(rvec)
         t_list.append(tvec)
@@ -493,15 +698,15 @@ if __name__ == "__main__":
         translation_error_list.append(t_error)
 
     if rotation_error_list and translation_error_list:
-        print("\n=== Pose Error (median over images) ===")
+        print("\n=== Pose Error (median over images) [CUSTOM P3P+RANSAC] ===")
         print(f"Rotation (deg):   {np.median(rotation_error_list):.10f}")
         print(f"Translation (L2): {np.median(translation_error_list):.10f}")
     else:
-        print("[WARN] No valid pose estimated.")
+        print("[WARN] No valid pose estimated by custom P3P+RANSAC.")
 
     Camera2World_Transform_Matrixs = []
     for r, t in zip(r_list, t_list):
-        # r: (3,1) rodrigues ; t: (3,1)
+        # r: (3,) rotvec ; t: (3,1)
         R_cw = R.from_rotvec(r.reshape(3)).as_matrix()    # world -> camera 的 R
         t_cw = t.reshape(3)                                # world -> camera 的 t
         # camera center in world: C = -R^T t

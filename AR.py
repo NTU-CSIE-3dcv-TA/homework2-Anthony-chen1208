@@ -52,12 +52,12 @@ def pnpsolver(query,model,cameraMatrix=0,distortion=0):
         if len(m_n) < 2:
             continue
         m, n = m_n
-        if m.distance < 0.75 * n.distance:
+        if m.distance < 0.70 * n.distance:
             good.append(m)
     # Keep only top-N matches to limit RANSAC per-iteration cost
     if good:
         good.sort(key=lambda m: m.distance)
-        good = good[:800]
+        good = good[:500]
     if len(good) < 4:
         return False, None, None, None
     # Use float32 to reduce memory and improve speed
@@ -71,9 +71,9 @@ def pnpsolver(query,model,cameraMatrix=0,distortion=0):
         imagePoints=img_pts,
         cameraMatrix=cameraMatrix,
         distCoeffs=distCoeffs,
-        iterationsCount=1000,
+        iterationsCount=500,
         reprojectionError=4.0,
-        confidence=0.995,
+        confidence=0.99,
         flags=pnp_flag
     )
     if not success or inliers is None or len(inliers) < 4:
@@ -103,6 +103,51 @@ def pnpsolver(query,model,cameraMatrix=0,distortion=0):
                                  rvec=rvec2,
                                  tvec=tvec2)
     return True, rvec2, tvec2, inliers
+
+def build_cube_points(grid=13):
+    """Create a unit cube (local frame) as a colored point set on its 6 faces.
+    Returns (P_local Nx3 float64, C_bgr Nx3 uint8).
+    """
+    g = max(2, int(grid))
+    lin = np.linspace(-0.5, 0.5, g)
+    uu, vv = np.meshgrid(lin, lin)
+    uv = np.stack([uu.ravel(), vv.ravel()], axis=1)
+
+    pts = []
+    cols = []
+    face_cols = [
+        (255, 0, 0),    # +X blue
+        (0, 255, 0),    # -X green
+        (0, 0, 255),    # +Y red
+        (0, 255, 255),  # -Y yellow
+        (255, 0, 255),  # +Z magenta
+        (255, 255, 0),  # -Z cyan
+    ]
+    pts.append(np.stack([np.full(uv.shape[0], 0.5), uv[:, 0], uv[:, 1]], axis=1)); cols.append(np.tile(face_cols[0], (uv.shape[0], 1)))
+    pts.append(np.stack([np.full(uv.shape[0],-0.5), uv[:, 0], uv[:, 1]], axis=1)); cols.append(np.tile(face_cols[1], (uv.shape[0], 1)))
+    pts.append(np.stack([uv[:, 0], np.full(uv.shape[0], 0.5), uv[:, 1]], axis=1)); cols.append(np.tile(face_cols[2], (uv.shape[0], 1)))
+    pts.append(np.stack([uv[:, 0], np.full(uv.shape[0],-0.5), uv[:, 1]], axis=1)); cols.append(np.tile(face_cols[3], (uv.shape[0], 1)))
+    pts.append(np.stack([uv[:, 0], uv[:, 1], np.full(uv.shape[0], 0.5)], axis=1)); cols.append(np.tile(face_cols[4], (uv.shape[0], 1)))
+    pts.append(np.stack([uv[:, 0], uv[:, 1], np.full(uv.shape[0],-0.5)], axis=1)); cols.append(np.tile(face_cols[5], (uv.shape[0], 1)))
+
+    P = np.concatenate(pts, axis=0).astype(np.float64)
+    C = np.concatenate(cols, axis=0).astype(np.uint8)
+    return P, C
+
+def apply_object_transform(P_local, T_obj_world):
+    """Apply a 3x4 transform [S*R|t] to local cube points to get world points."""
+    return (T_obj_world @ np.c_[P_local, np.ones((P_local.shape[0], 1))].T).T
+
+def project_world(Pw, rvec, tvec, K):
+    """Project world points using world->camera pose and intrinsics K. Returns (uv Nx2, z Nx)."""
+    R_cw = R.from_rotvec(rvec.reshape(3)).as_matrix()
+    Pc = (R_cw @ Pw.T).T + tvec.reshape(1, 3)
+    z = Pc[:, 2]
+    xy = Pc[:, :2] / np.clip(z[:, None], 1e-12, None)
+    uv = np.empty_like(xy)
+    uv[:, 0] = K[0,0] * xy[:, 0] + K[0,2]
+    uv[:, 1] = K[1,1] * xy[:, 1] + K[1,2]
+    return uv, z
 
 def rotation_error(R1, R2):
     R1 = np.asarray(R1)
@@ -426,7 +471,7 @@ def visualization(
         except Exception:
             pass
     o3d.visualization.draw_geometries(geoms)
-if __name__ == "__main__":
+if False and __name__ == "__main__":
     # Load data
     BASE_DIR = Path(__file__).resolve().parent
     DATA_DIR = BASE_DIR / "data"
@@ -445,12 +490,7 @@ if __name__ == "__main__":
 
 
     # Use all available query/validation images from point_desc_df
-    # IMAGE_ID_LIST = sorted(point_desc_df["IMAGE_ID"].unique().tolist())
-    # Only use validation images (filename contains 'valid') and ensure descriptors exist
-    valid_mask = images_df["NAME"].astype(str).str.contains("valid", case=False, regex=False)
-    valid_ids = set(images_df.loc[valid_mask, "IMAGE_ID"].tolist())
-    desc_ids = set(point_desc_df["IMAGE_ID"].unique().tolist())
-    IMAGE_ID_LIST = sorted(valid_ids.intersection(desc_ids))
+    IMAGE_ID_LIST = sorted(point_desc_df["IMAGE_ID"].unique().tolist())
     r_list = []
     t_list = []
     rotation_error_list = []
@@ -534,3 +574,91 @@ if __name__ == "__main__":
         frustum_size_gain=1.8,
         sphere_size_gain=1.8,
     )
+
+if __name__ == "__main__":
+    # Data paths
+    BASE_DIR = Path(__file__).resolve().parent
+    DATA_DIR = BASE_DIR / "data"
+
+    # Load COLMAP-derived data
+    images_df = pd.read_pickle(DATA_DIR / "images.pkl")
+    train_df = pd.read_pickle(DATA_DIR / "train.pkl")
+    points3D_df = pd.read_pickle(DATA_DIR / "points3D.pkl")
+    point_desc_df = pd.read_pickle(DATA_DIR / "point_desc.pkl")
+
+    # Prepare model descriptors (average per 3D point)
+    desc_df = average_desc(train_df, points3D_df)
+    kp_model = np.array(desc_df["XYZ"].to_list())
+    desc_model = np.array(desc_df["DESCRIPTORS"].to_list()).astype(np.float32)
+    desc_model /= (np.linalg.norm(desc_model, axis=1, keepdims=True) + 1e-8)
+
+    # Intrinsics (consistent with pnpsolver)
+    K = np.array([[1868.27, 0.0, 540.0],
+                  [0.0, 1869.18, 960.0],
+                  [0.0,    0.0,   1.0]], dtype=np.float64)
+
+    # Load cube transform saved from transform_cube.py; else identity
+    T_path = BASE_DIR / "cube_transform_mat.npy"
+    if T_path.exists():
+        T_obj_world = np.load(T_path)
+        if T_obj_world.shape != (3, 4):
+            raise ValueError("cube_transform_mat.npy must be 3x4 matrix (scale*R | t)")
+    else:
+        T_obj_world = np.hstack([np.eye(3), np.zeros((3, 1))])
+
+    # Build cube points once and transform to world
+    P_local, C_bgr = build_cube_points(grid=13)
+    Pw = apply_object_transform(P_local, T_obj_world)
+
+    # Output setup
+    OUT_DIR = BASE_DIR / "output" / "ar_frames"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    video_path = BASE_DIR / "output" / "ar_cube.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = None
+
+    # Iterate only over validation images (filter by filename pattern in images_df)
+    valid_mask = images_df["NAME"].astype(str).str.contains("valid", case=False, regex=False)
+    valid_ids = images_df.loc[valid_mask, "IMAGE_ID"].tolist()
+    # Ensure descriptors exist for these images
+    desc_ids = set(point_desc_df["IMAGE_ID"].unique().tolist())
+    IMAGE_ID_LIST = sorted([i for i in valid_ids if i in desc_ids])
+    for idx in tqdm(IMAGE_ID_LIST):
+        # Load frame
+        fname = (images_df.loc[images_df["IMAGE_ID"] == idx])["NAME"].values[0]
+        frame_path = DATA_DIR / "frames" / fname
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            continue
+        if writer is None:
+            writer = cv2.VideoWriter(str(video_path), fourcc, 10.0, (frame.shape[1], frame.shape[0]))
+
+        # Query keypoints and descriptors
+        points = point_desc_df.loc[point_desc_df["IMAGE_ID"] == idx]
+        kp_query = np.array(points["XY"].to_list())
+        desc_query = np.array(points["DESCRIPTORS"].to_list()).astype(np.float32)
+
+        # Pose estimation via the same RANSAC method as 2d3dmathcing.py
+        ok, rvec, tvec, inliers = pnpsolver((kp_query, desc_query), (kp_model, desc_model))
+
+        if ok:
+            uv, depth = project_world(Pw, rvec, tvec, K)
+            # Painter: draw far -> near, only points in front of camera
+            valid = depth > 1e-6
+            order = np.argsort(depth)[::-1]  # far to near
+            order = order[valid[order]]
+            rad = max(1, int(0.004 * max(frame.shape[0], frame.shape[1])))
+            for i in order:
+                u, v = uv[i]
+                color = tuple(int(c) for c in C_bgr[i])
+                cv2.circle(frame, (int(round(u)), int(round(v))), rad, color, thickness=-1, lineType=cv2.LINE_AA)
+
+        # Save frame and video
+        cv2.imwrite(str(OUT_DIR / fname), frame)
+        if writer is not None:
+            writer.write(frame)
+
+    if writer is not None:
+        writer.release()
+    print("Saved AR frames to", OUT_DIR)
+    print("Saved AR video to", video_path)
