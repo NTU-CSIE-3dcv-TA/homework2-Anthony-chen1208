@@ -1,0 +1,6 @@
+& C:/3DCV/.venv/Scripts/Activate.ps1
+cd homework2-Anthony-chen1208
+python -u "c:\3DCV\homework2-Anthony-chen1208\2d3dmathcing.py"
+python -u "c:\3DCV\homework2-Anthony-chen1208\p3p_ransac_1.py" 
+python -u "c:\3DCV\homework2-Anthony-chen1208\transform_cube.py"   
+python -u "c:\3DCV\homework2-Anthony-chen1208\AR.py"
